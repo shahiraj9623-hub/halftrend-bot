@@ -4,22 +4,27 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 TICKER = "GC=F"
 AMPLITUDE = 5
 TF_MIN = 3
 STATE_FILE = "last_alert.txt"
-MAX_AGE_MIN = 15  # ignore signals older than this
+MAX_AGE_MIN = 15
 
 
 def send(msg):
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
-        timeout=15,
-    )
-    print("Telegram:", r.status_code, r.text[:100])
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        print("Telegram:", r.status_code, r.text[:200])
+        return r.ok
+    except Exception as e:
+        print("Telegram exception:", e)
+        return False
 
 
 def fetch_closed_3m():
@@ -134,9 +139,12 @@ def main():
            f"{TICKER} @ {price:.2f}\n"
            f"HT: {row['ht']:.2f}\n"
            f"Bar close (UTC): {bar_close.tz_convert('UTC').strftime('%d-%b %H:%M')}")
-    send(msg)
-    with open(STATE_FILE, "w") as f:
-        f.write(str(ts))
+    if send(msg):
+        with open(STATE_FILE, "w") as f:
+            f.write(str(ts))
+        print("Alert sent and saved:", ts)
+    else:
+        print("Telegram FAILED, will retry next run")
 
 
 main()
