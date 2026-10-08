@@ -14,11 +14,12 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install yfinance requests pandas numpy
-      - run: python test_telegram.py
+      - run: python bot.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      - run: python bot.py
+      - run: python premarket.py
+        if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -28,3 +29,4 @@ jobs:
           git add -A
           git commit -m "state" || exit 0
           git push
+        if: always()
