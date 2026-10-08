@@ -1,40 +1,55 @@
-import os, json, requests
-import numpy as np
-import pandas as pd
-import yfinance as yf
-from zoneinfo import ZoneInfo
+import os, re, json, time
 import datetime as dt
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
+import requests
+import pandas as pd
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
 MIN_PRICE = 5.0
 MIN_PM_VOLUME = 50_000
 MIN_PM_DOLLAR_VOL = 500_000
 MIN_ABS_CHANGE = 2.0
 EXCHANGES = ["NYSE", "NASDAQ", "AMEX"]
-TOP_N = 25
-AMPLITUDE = 5
-TF_MIN = 3
-MAX_AGE_MIN = 15
+NEWS_CHECK = 40
+NEWS_HOURS = 48
+FINAL_TOP = 10
 SUMMARY_EVERY_MIN = 28
 STATE_FILE = "pm_state.json"
 ET = ZoneInfo("America/New_York")
 IST = ZoneInfo("Asia/Kolkata")
 
 TV_URL = "https://scanner.tradingview.com/america/scan"
-TV_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36",
-    "Content-Type": "application/json",
-    "Origin": "https://www.tradingview.com",
-    "Referer": "https://www.tradingview.com/",
-}
+UA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+TV_HEADERS = {"User-Agent": UA, "Content-Type": "application/json",
+              "Origin": "https://www.tradingview.com",
+              "Referer": "https://www.tradingview.com/"}
+NEWS_HEADERS = {"User-Agent": UA}
+CORE = ["name", "description", "close", "premarket_close",
+        "premarket_change", "premarket_volume"]
+OPTIONAL = ["average_volume_10d_calc"]
+
+JUNK = re.compile(
+    r"(stock price,? news|quote\s*&\s*history|interactive stock chart|historical (prices|data)"
+    r"|stock price today|share price today|price today|\b[A-Z]{1,6}\d{6}[CP]\d{8}\b"
+    r"|\b\d{4}\s+\d+(\.\d+)?\s+(put|call)\b)", re.I)
+BACKGROUND = re.compile(
+    r"\b(this year|year[- ]to[- ]date|ytd|best[- ]performers?|top \d+ (performers|stocks))\b", re.I)
 
 
 def send(msg):
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": msg}, timeout=15)
-    print("Telegram:", r.status_code)
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                          data={"chat_id": CHAT_ID, "text": msg[:4000]}, timeout=15)
+        print("Telegram:", r.status_code, r.text[:150])
+        return r.ok
+    except Exception as e:
+        print("Telegram exception:", e)
+        return False
 
 
 def load_state():
@@ -43,23 +58,18 @@ def load_state():
             return json.load(open(STATE_FILE))
         except Exception:
             pass
-    return {"last_summary": "", "alerts": {}}
+    return {"last_summary": ""}
 
 
-def save_state(st):
-    json.dump(st, open(STATE_FILE, "w"))
+def tv_request(columns, filters, limit):
+    payload = {"filter": filters, "options": {"lang": "en"}, "markets": ["america"],
+               "symbols": {"query": {"types": []}, "tickers": []}, "columns": columns,
+               "sort": {"sortBy": "premarket_volume", "sortOrder": "desc"},
+               "range": [0, limit]}
+    return requests.post(TV_URL, json=payload, headers=TV_HEADERS, timeout=30)
 
 
-def in_window(now_et):
-    if now_et.weekday() >= 5:
-        return False
-    t = now_et.time()
-    return dt.time(4, 0) <= t < dt.time(9, 30)
-
-
-def tv_list():
-    cols = ["name", "description", "close", "premarket_close",
-            "premarket_change", "premarket_volume"]
+def stage1():
     filters = [
         {"left": "exchange", "operation": "in_range", "right": EXCHANGES},
         {"left": "type", "operation": "equal", "right": "stock"},
@@ -67,20 +77,18 @@ def tv_list():
         {"left": "close", "operation": "egreater", "right": MIN_PRICE},
         {"left": "premarket_volume", "operation": "egreater", "right": MIN_PM_VOLUME},
     ]
-    payload = {
-        "filter": filters, "options": {"lang": "en"}, "markets": ["america"],
-        "symbols": {"query": {"types": []}, "tickers": []}, "columns": cols,
-        "sort": {"sortBy": "premarket_volume", "sortOrder": "desc"},
-        "range": [0, 1000],
-    }
-    r = requests.post(TV_URL, json=payload, headers=TV_HEADERS, timeout=30)
+    cols = CORE + OPTIONAL
+    r = tv_request(cols, filters, 1000)
+    if not r.ok:
+        cols = CORE
+        r = tv_request(cols, filters, 1000)
     r.raise_for_status()
     rows = r.json().get("data", [])
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([dict(zip(cols, x["d"])) for x in rows])
     df.insert(0, "symbol", [x["s"].split(":")[1] for x in rows])
-    for c in ["premarket_close", "premarket_change", "premarket_volume"]:
+    for c in ["close", "premarket_close", "premarket_change", "premarket_volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["premarket_close", "premarket_change", "premarket_volume"])
     df = df[df["premarket_close"] >= MIN_PRICE].copy()
@@ -89,119 +97,140 @@ def tv_list():
     df = df[(df["dvol"] >= MIN_PM_DOLLAR_VOL) & (df["abs_chg"] >= MIN_ABS_CHANGE)].copy()
     if df.empty:
         return df
-    df["score"] = df["dvol"].rank(pct=True) + df["abs_chg"].rank(pct=True)
-    return df.sort_values("score", ascending=False).head(TOP_N).reset_index(drop=True)
+    s = df["dvol"].rank(pct=True) + df["abs_chg"].rank(pct=True)
+    if "average_volume_10d_calc" in df.columns:
+        avg = pd.to_numeric(df["average_volume_10d_calc"], errors="coerce")
+        df["rvol"] = df["premarket_volume"] / avg
+        s = s + df["rvol"].rank(pct=True).fillna(0)
+    df["pre_score"] = s
+    return df.sort_values("pre_score", ascending=False).reset_index(drop=True)
 
 
-def heikin_ashi(df):
-    o, h, l, c = (df[k].values for k in ["Open", "High", "Low", "Close"])
-    ha_c = (o + h + l + c) / 4.0
-    ha_o = np.empty(len(df))
-    ha_o[0] = (o[0] + c[0]) / 2.0
-    for i in range(1, len(df)):
-        ha_o[i] = (ha_o[i - 1] + ha_c[i - 1]) / 2.0
-    return pd.DataFrame({"h": np.maximum.reduce([h, ha_o, ha_c]),
-                         "l": np.minimum.reduce([l, ha_o, ha_c]),
-                         "c": ha_c}, index=df.index)
+def clean_name(desc, sym):
+    name = re.sub(r"\b(?:inc|corp|corporation|ltd|limited|holdings|holding|plc|group|company|co)\b\.?",
+                  "", desc or "", flags=re.I)
+    name = re.sub(r"[,]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name if len(name) >= 3 else sym
 
 
-def halftrend(ha, amplitude=5):
-    h, l, c = ha["h"], ha["l"], ha["c"]
-    n = len(ha)
-    hp = h.rolling(amplitude, min_periods=1).max().values
-    lp = l.rolling(amplitude, min_periods=1).min().values
-    hma = h.rolling(amplitude, min_periods=1).mean().values
-    lma = l.rolling(amplitude, min_periods=1).mean().values
-    H, L, C = h.values, l.values, c.values
-    buy = np.zeros(n, dtype=bool)
-    sell = np.zeros(n, dtype=bool)
-    cur, nxt = 0, 0
-    max_low, min_high = L[0], H[0]
-    for i in range(1, n):
-        prev = cur
-        if nxt == 1:
-            max_low = max(lp[i], max_low)
-            if hma[i] < max_low and C[i] < L[i - 1]:
-                cur, nxt = 1, 0
-                min_high = hp[i]
-        else:
-            min_high = min(hp[i], min_high)
-            if lma[i] > min_high and C[i] > H[i - 1]:
-                cur, nxt = 0, 1
-                max_low = lp[i]
-        buy[i] = cur == 0 and prev == 1
-        sell[i] = cur == 1 and prev == 0
-    return buy, sell
-
-
-def scan(symbols):
-    data = yf.download(symbols, period="2d", interval="1m", prepost=True,
-                       group_by="ticker", threads=True, progress=False,
-                       auto_adjust=False)
-    now = pd.Timestamp.now(tz=ET)
-    found = []
-    for s in symbols:
+def fetch_rss(url, default_source, strip_suffix=False):
+    try:
+        r = requests.get(url, headers=NEWS_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        root = ET.fromstring(r.content)
+    except Exception:
+        return None
+    items = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        pub = it.findtext("pubDate")
+        if not title or not pub:
+            continue
+        src = (it.findtext("source") or default_source).strip()
+        if strip_suffix and " - " in title:
+            head, tail = title.rsplit(" - ", 1)
+            if tail.strip().lower() == src.lower():
+                title = head.strip()
         try:
-            d = data[s] if isinstance(data.columns, pd.MultiIndex) else data
-            d = d[["Open", "High", "Low", "Close"]].dropna()
-            if d.empty:
-                continue
-            bars = d.resample(f"{TF_MIN}min", label="left", closed="left").agg(
-                {"Open": "first", "High": "max", "Low": "min", "Close": "last"}).dropna()
-            bars = bars[bars.index + pd.Timedelta(minutes=TF_MIN) <= now]
-            if len(bars) < AMPLITUDE + 5:
-                continue
-            buy, sell = halftrend(heikin_ashi(bars), AMPLITUDE)
-            idx = np.where(buy | sell)[0]
-            if len(idx) == 0:
-                continue
-            i = idx[-1]
-            ts = bars.index[i]
-            end = ts + pd.Timedelta(minutes=TF_MIN)
-            if (now - end).total_seconds() / 60 > MAX_AGE_MIN:
-                continue
-            found.append((s, "BUY" if buy[i] else "SELL", float(bars["Close"].iloc[i]), ts))
-        except Exception as e:
-            print("skip", s, e)
-    return found
+            ts = pd.Timestamp(parsedate_to_datetime(pub))
+            ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        except Exception:
+            continue
+        items.append((ts, title, src))
+    return items
+
+
+def is_relevant(title, sym, name):
+    if re.search(r"\b" + re.escape(sym) + r"\b", title):
+        return True
+    first = name.split()[0].lower() if name else ""
+    return len(first) >= 5 and first in title.lower()
+
+
+def get_news(sym, desc):
+    """Returns (tag, top_headline)."""
+    name = clean_name(desc, sym)
+    days = max(1, round(NEWS_HOURS / 24))
+    g_url = ("https://news.google.com/rss/search?q=" + quote_plus(f'"{name}" stock when:{days}d')
+             + "&hl=en-US&gl=US&ceid=US:en")
+    y_url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={sym.replace('.', '-')}&region=US&lang=en-US"
+    g = fetch_rss(g_url, "Google News", strip_suffix=True)
+    y = fetch_rss(y_url, "Yahoo Finance")
+    if g is None and y is None:
+        return "?", ""
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=NEWS_HOURS)
+    seen, cats, bg, generic = set(), [], 0, 0
+    for ts, title, src in (y or []) + (g or []):
+        key = title.lower()
+        if ts < cutoff or key in seen or JUNK.search(title):
+            continue
+        seen.add(key)
+        if not is_relevant(title, sym, name):
+            generic += 1
+        elif BACKGROUND.search(title):
+            bg += 1
+        else:
+            cats.append((ts, title, src))
+    if cats:
+        cats.sort(key=lambda x: -x[0].timestamp())
+        return f"NEWS({len(cats)})", f"{cats[0][1][:90]} ({cats[0][2]})"
+    if bg:
+        return "background", ""
+    return ("generic" if generic else "no-news"), ""
 
 
 def main():
     now_et = dt.datetime.now(ET)
     now_ist = now_et.astimezone(IST)
-    if not in_window(now_et):
+    t = now_et.time()
+    if now_et.weekday() >= 5 or not (dt.time(4, 0) <= t < dt.time(9, 30)):
         print("Outside premarket window:", now_ist.strftime("%d-%b %H:%M IST"))
         return
 
     st = load_state()
-    df = tv_list()
-    if df.empty:
-        print("TV list empty")
-        return
-    info = df.set_index("symbol")
-
     last = st.get("last_summary", "")
-    due = True
     if last:
-        due = (now_et - dt.datetime.fromisoformat(last)).total_seconds() / 60 >= SUMMARY_EVERY_MIN
-    if due:
-        lines = [f"TV LIST ({now_ist:%H:%M} IST)  Symbol | PM% | $Vol(M)"]
-        for _, r in df.iterrows():
-            lines.append(f"{r['symbol']} | {r['premarket_change']:+.1f}% | {r['dvol'] / 1e6:.1f}M")
-        send("\n".join(lines))
+        gap = (now_et - dt.datetime.fromisoformat(last)).total_seconds() / 60
+        if gap < SUMMARY_EVERY_MIN:
+            print(f"Last summary {gap:.0f} min ago, skipping")
+            return
+
+    df = stage1()
+    if df.empty:
+        print("No stocks passed filters")
+        return
+
+    top = df.head(NEWS_CHECK).copy()
+    tags, heads = [], []
+    for sym, desc in zip(top["symbol"], top["description"]):
+        tg, hd = get_news(sym, desc)
+        tags.append(tg)
+        heads.append(hd)
+        time.sleep(0.3)
+    top["tag"] = tags
+    top["head"] = heads
+    top["final"] = top["pre_score"] + top["tag"].str.startswith("NEWS").astype(float)
+    top = top.sort_values("final", ascending=False).head(FINAL_TOP)
+
+    lines = [f"PREMARKET TOP {len(top)} ({now_ist:%H:%M} IST)",
+             "Symbol | $Price | Chg% | $Vol(M) | RVOL | News", ""]
+    for _, r in top.iterrows():
+        rv = f"{r['rvol']:.2f}" if "rvol" in top.columns and pd.notna(r.get("rvol")) else "-"
+        lines.append(f"{r['symbol']} | ${r['premarket_close']:.2f} | {r['premarket_change']:+.1f}% | "
+                     f"{r['dvol'] / 1e6:.1f}M | {rv} | {r['tag']}")
+        if r["head"]:
+            lines.append(f"   > {r['head']}")
+    lines.append("")
+    lines.append("Entry se pehle chart, spread aur levels check karo.")
+
+    if send("\n".join(lines)):
         st["last_summary"] = now_et.isoformat()
-
-    for sym, side, price, ts in scan(list(df["symbol"])):
-        if st["alerts"].get(sym) == str(ts):
-            continue
-        r = info.loc[sym]
-        send(f"TV + HALFTREND {side}\n{sym} @ {price:.2f}\n"
-             f"PM change: {r['premarket_change']:+.2f}%\n"
-             f"PM $Vol: {r['dvol'] / 1e6:.1f}M\n"
-             f"Bar close: {(ts + pd.Timedelta(minutes=TF_MIN)).astimezone(IST):%H:%M} IST")
-        st["alerts"][sym] = str(ts)
-
-    save_state(st)
+        json.dump(st, open(STATE_FILE, "w"))
+        print("Summary sent")
+    else:
+        print("Telegram FAILED, will retry next run")
 
 
 main()
