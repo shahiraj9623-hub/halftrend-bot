@@ -8,9 +8,9 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 TICKER = "GC=F"
 AMPLITUDE = 5
-TF_MIN = 3
+TF_MIN = 15
 STATE_FILE = "last_alert.txt"
-MAX_AGE_MIN = 15
+MAX_AGE_MIN = 25
 
 
 def send(msg):
@@ -27,7 +27,7 @@ def send(msg):
         return False
 
 
-def fetch_closed_3m():
+def fetch_closed_bars():
     df = yf.download(TICKER, period="5d", interval="1m",
                      progress=False, auto_adjust=False)
     if df is None or df.empty:
@@ -106,7 +106,7 @@ def halftrend(ha, amplitude=5):
 
 
 def main():
-    bars = fetch_closed_3m()
+    bars = fetch_closed_bars()
     if bars is None or len(bars) < AMPLITUDE + 5:
         print("No data / market closed")
         return
@@ -135,7 +135,7 @@ def main():
 
     side = "BUY" if row["buy"] else "SELL"
     price = bars.loc[ts, "Close"]
-    msg = (f"<b>{side} SIGNAL</b> (HalfTrend)\n"
+    msg = (f"<b>{side} SIGNAL</b> (HalfTrend {TF_MIN}m)\n"
            f"{TICKER} @ {price:.2f}\n"
            f"HT: {row['ht']:.2f}\n"
            f"Bar close (UTC): {bar_close.tz_convert('UTC').strftime('%d-%b %H:%M')}")
