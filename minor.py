@@ -8,7 +8,7 @@ KEY = os.environ["TWELVE_API_KEY"].strip()
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
-FACTOR = -0.167          # Minor Support Barrier
+OFFSET = 0.0835          # factor 0.167 / 2
 TF_MIN = 3
 MAX_AGE_MIN = 15
 STATE_FILE = "minor_state.json"
@@ -74,44 +74,56 @@ def main():
         return
 
     open_px = float(df.loc[ts_anchor, "open"])
-    level = (math.sqrt(open_px) + FACTOR / 2) ** 2
-    print(f"Anchor {anchor:%Y-%m-%d %H:%M} UTC | open {open_px:.2f} | level {level:.2f}")
+    root = math.sqrt(open_px)
+    res = (root + OFFSET) ** 2
+    sup = (root - OFFSET) ** 2
+    print(f"Anchor {anchor:%Y-%m-%d %H:%M} UTC | open {open_px:.2f} | "
+          f"resistance {res:.2f} | support {sup:.2f}")
 
     day = df[df.index >= ts_anchor]
     bars = day.resample(f"{TF_MIN}min", label="left", closed="left").agg(
         {"open": "first", "close": "last"}).dropna()
-    last_1m = df.index[-1]
-    now_floor = pd.Timestamp(now).floor("min")
-    limit = min(last_1m + pd.Timedelta(minutes=1), now_floor)
+    limit = min(df.index[-1] + pd.Timedelta(minutes=1), pd.Timestamp(now).floor("min"))
     bars = bars[bars.index + pd.Timedelta(minutes=TF_MIN) <= limit]
-    if len(bars) < 2:
-        print("Not enough closed bars yet")
+    if bars.empty:
+        print("No closed bars yet")
         return
+
+    def zone(o, c):
+        if o > res and c > res:
+            return "ABOVE"
+        if o < sup and c < sup:
+            return "BELOW"
+        return "INSIDE"
 
     st = load_state()
     last_done = pd.Timestamp(st["last_done"]) if st.get("last_done") else None
-    closes = bars["close"]
 
-    for i in range(1, len(bars)):
-        ts = bars.index[i]
-        if last_done is not None and ts <= last_done:
-            continue
-        prev_c, c = float(closes.iloc[i - 1]), float(closes.iloc[i])
-        end = ts + pd.Timedelta(minutes=TF_MIN)
-        age = (now - end.to_pydatetime()).total_seconds() / 60
-        side = None
-        if prev_c <= level < c:
-            side = "ABOVE"
-        elif prev_c >= level > c:
-            side = "BELOW"
-        if side and age <= MAX_AGE_MIN:
-            msg = (f"XAUUSD 3m: close {c:.2f} crossed {side} level {level:.2f}\n"
-                   f"Bar close: {end.astimezone(IST):%d-%b %H:%M} IST")
-            if not send(msg):
-                print("Telegram FAILED, will retry next run")
-                break
-            print("Alert sent:", ts)
-        st["last_done"] = str(ts)
+    prev = None
+    for ts, row in bars.iterrows():
+        z = zone(float(row["open"]), float(row["close"]))
+        # first candle of the day never alerts, it only sets the starting state
+        if prev is not None and z != "INSIDE" and z != prev:
+            if last_done is None or ts > last_done:
+                end = ts + pd.Timedelta(minutes=TF_MIN)
+                age = (now - end.to_pydatetime()).total_seconds() / 60
+                if age <= MAX_AGE_MIN:
+                    t = f"{end.astimezone(IST):%I:%M %p} IST"
+                    c = float(row["close"])
+                    if z == "ABOVE":
+                        msg = (f"XAUUSD 3m: candle opened and closed above "
+                               f"Minor Resistance {res:.2f}. Close {c:.2f}. "
+                               f"Bar close: {t}")
+                    else:
+                        msg = (f"XAUUSD 3m: candle opened and closed below "
+                               f"Minor Support {sup:.2f}. Close {c:.2f}. "
+                               f"Bar close: {t}")
+                    if not send(msg):
+                        print("Telegram FAILED, will retry next run")
+                        return
+                    print("Alert sent:", ts, z)
+                st["last_done"] = str(ts)
+        prev = z
 
     json.dump(st, open(STATE_FILE, "w"))
 
